@@ -6,7 +6,7 @@ FESEPL stands for Free-Energy State Estimator with Precision Learning.
 
 ## Included files
 
-- `FESEPL.py`: the renamed estimator implementation
+- `FESEPL.py`: the estimator implementation
 - `PlantClass.py`: plant and simulation dynamics
 - `runner.py`: single-run experiment script
 - `run_FESEPL.py`: experiment helpers used by `runner.py`
