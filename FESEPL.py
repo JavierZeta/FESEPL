@@ -1,3 +1,24 @@
+"""Free-Energy State Estimator with Precision Learning.
+
+This file is intentionally written as a companion to `Derivation.pdf`.
+The computational heart of the estimator is small:
+
+1. Encode the state estimate as a population code:      mu = D r
+2. Build frozen channel precisions:                    Pi_y, Pi_mu
+3. Relax spikes by the free-energy voltage rule:       v = b - O r
+4. Learn precision from pre-fit innovations:           nu = y - mu_prior
+5. Reconstruct variances from gain and scale:          q_mu = K S, q_y = (1-K) S
+
+The comments below use two labels:
+
+- MATH: the line is one of the equations from the derivation.
+- GUARDRAIL: validation, clipping, shape handling, or numerical safety.
+
+Those guardrails matter for making the code robust, but they are not new
+dynamics. If someone wants to reimplement the algorithm, the MATH comments are
+the shortest path through the file.
+"""
+
 import numpy as np
 
 
@@ -5,8 +26,31 @@ rng = np.random.default_rng()
 
 
 class FESEPL:
-    """
-    Spiking free-energy state estimator for the matched-channel case
+    """Spiking free-energy state estimator for the matched-channel case.
+
+    The implementation follows the derivation in five blocks.
+
+    Setup
+        Store the plant matrices, create the decoder D, and initialise the
+        variance/gain state.
+
+    Fast loop
+        For one outer time step, hold y, mu_prior, Pi_y, and Pi_mu fixed. The
+        population then spikes only when doing so decreases the quadratic
+        free energy.
+
+    Exact posterior
+        Compute mu_star, the closed-form Bayesian posterior for the same frozen
+        precisions. This is a diagnostic target for the spiking approximation,
+        not an input to the spike dynamics.
+
+    Slow traces
+        Measure the pre-fit innovation nu = y - mu_prior and keep local traces
+        z, c0, c1. These are the statistics used for whitening.
+
+    Precision learning
+        Learn gain K = sigmoid(g) and scale S from the innovation traces, then
+        reconstruct q_mu = K S and q_y = (1 - K) S.
 
         C = I,  m = n .
 
@@ -87,15 +131,19 @@ class FESEPL:
         variance_floor=1e-8,
         lambda_clip=(-20.0, 20.0),
     ):
+        # --- Plant and dimensions -------------------------------------------------
         self.system = system
         self.rng = np.random.default_rng(decoder_seed) if decoder_seed is not None else rng
 
         self.n = system.x_k
         self.m = system.y_k
 
+        # MATH: linear internal model used for the predictive prior.
+        #       mu_prior = Phi mu, with Phi ~= I + dt A_int.
         self.A_int = np.array(system.A_lin, dtype=float, copy=True)
         self.C = np.array(system.C, dtype=float, copy=True)
 
+        # --- Numerical parameters and guardrails ---------------------------------
         self.N = max(2 * self.n, 32) if N is None else int(N)
         if self.N < 2 * self.n:
             raise ValueError(f"N must be at least 2 * x_k = {2 * self.n}, got {self.N}")
@@ -128,6 +176,9 @@ class FESEPL:
             raise ValueError("prior_window_factor must be positive")
         if not (0.0 < self.gain_min < self.gain_max < 1.0):
             raise ValueError("gain_min and gain_max must satisfy 0 < gain_min < gain_max < 1")
+
+        # GUARDRAIL: this implementation is exactly the matched-channel case
+        # from Derivation sections 2.4 and 10.1.
         self.full_state_observation = (
             self.m == self.n and np.allclose(self.C, np.eye(self.n))
         )
@@ -137,11 +188,13 @@ class FESEPL:
                 "(C = I, m = n)."
             )
 
+        # --- Slow learner initial state ------------------------------------------
         self.discrete_targets_ready = False
 
-        # q_*_initial are the live starting values used to stress-test recovery.
-        # Any slow regularization is allowed to pull only toward this initial
-        # estimator guess, never toward an analytically computed target.
+        # GUARDRAIL: q_*_initial are the live starting values used to
+        # stress-test recovery. Any slow regularization is allowed to pull only
+        # toward this initial estimator guess, never toward an analytically
+        # computed target.
         self.q_y_initial = self._make_variance_guess(
             observation_variance_guess,
             self.m,
@@ -155,7 +208,12 @@ class FESEPL:
         self.q_y0 = self.q_y_initial.copy()
         self.q_mu0 = self.q_mu_initial.copy()
 
+        # --- Decoder and initial gain/scale --------------------------------------
+        # MATH: neural code, mu = D r.
         self.D = self._build_decoder()
+
+        # MATH: store log-precision equivalents and logit gain.
+        #       K = q_mu / (q_mu + q_y), g = logit(K), S = q_mu + q_y.
         self.lambda_y0 = -np.log(self.q_y0)
         self.lambda_mu0 = -np.log(self.q_mu0)
         self.g0 = self._logit(
@@ -170,6 +228,12 @@ class FESEPL:
         self.reset()
 
     def _make_variance_guess(self, guess, dim, fallback):
+        """Return a positive channel-variance vector.
+
+        This is input hygiene, not estimator dynamics. Scalars, vectors, and
+        diagonal covariance matrices are accepted so experiments can be written
+        conveniently.
+        """
         if guess is None:
             guess = np.array(fallback, dtype=float, copy=True)
         else:
@@ -188,6 +252,15 @@ class FESEPL:
 
     def _build_decoder(self):
         """
+        Build the fixed population decoder D.
+
+        MATH: the neural estimate is always `mu = D r`.
+
+        Implementation choice: signed basis columns guarantee every state
+        dimension has at least one positive and one negative coding direction.
+        Extra columns are random unit directions. The final scale keeps spike
+        magnitudes in the same range as the original experiments.
+
         Match the simple style used in the earlier FESEPL class:
         signed basis columns first, random unit columns after that, then shuffle.
         """
@@ -256,36 +329,49 @@ class FESEPL:
         self.c1 = np.zeros(self.n)
 
     def reset(self):
+        """Reset all dynamic state without rebuilding the decoder or parameters."""
+        # --- State estimates and observations ------------------------------------
         self.mu = np.zeros(self.n)
         self.mu_prior = np.zeros(self.n)
         self.mu_star = np.zeros(self.n)
         self.y = np.zeros(self.m)
 
+        # --- Spike population state ----------------------------------------------
+        # MATH: r stores filtered spike counts, v stores the membrane voltage.
         self.r = np.zeros(self.N)
         self.v = np.zeros(self.N)
         self.spike_totals = np.zeros(self.N)
+
+        # MATH: v = bias - O r. `window_O` is the O used inside the current
+        # frozen fast-loop window.
         self.bias = np.zeros(self.N)
         self.O = np.zeros((self.N, self.N))
         self.window_O = None
 
+        # --- Fast-loop errors -----------------------------------------------------
+        # MATH: e_y = y - mu, e_mu = mu_prior - mu.
         self.e_y = np.zeros(self.m)
         self.e_mu = np.zeros(self.n)
         self.e_y_weighted = np.zeros(self.m)
         self.e_mu_weighted = np.zeros(self.n)
 
+        # --- Innovation and diagnostics ------------------------------------------
+        # MATH: nu = y - mu_prior is measured before posterior correction.
         self.nu_y = np.zeros(self.m)
         self.nu_mu = np.zeros(self.n)
         self.eps_y = np.zeros(self.m)
         self.eps_mu = np.zeros(self.n)
         self.delta_mu = np.zeros(self.n)
 
-        # Current local variance estimates used to define the fast-loop
-        # precisions. These are updated only at the end of each accumulation
-        # window.
+        # --- Slow learner state ---------------------------------------------------
+        # MATH: current local variance estimates. These define the fast-loop
+        # precisions and are updated only after the innovation traces are updated.
         self.q_y = self.q_y_initial.copy()
         self.q_mu = self.q_mu_initial.copy()
         self.g = self.g0.copy()
         self.scale = self.scale0.copy()
+
+        # MATH: pi_y = 1/q_y and pi_mu = 1/q_mu, represented via lambda = log(pi).
         self.lambda_y = -np.log(self.q_y)
         self.lambda_mu = -np.log(self.q_mu)
         self.pi_y = np.zeros(self.n)
@@ -314,8 +400,11 @@ class FESEPL:
         self.initialised = False
 
     def setup(self, y0=None, mu0=None):
-        """
-        Initialise the posterior state estimate before the first update.
+        """Initialise the posterior state estimate before the first update.
+
+        Most of this method is compatibility/setup. The key mathematical line is
+        the encoding `r = pinv(D) mu`, which chooses spike counts whose decoded
+        state starts at the requested initial posterior mean.
         """
         if mu0 is None:
             if y0 is None:
@@ -333,11 +422,17 @@ class FESEPL:
         self.mu = mu0.copy()
         self.mu_prior = mu0.copy()
         self.y = y0.copy()
+
+        # MATH: initialise the neural code so that mu = D r at time zero.
         self.r = np.linalg.pinv(self.D) @ self.mu
 
         self._refresh_precisions()
+
+        # MATH: bias b = D^T (Pi_y y + Pi_mu mu_prior).
         self.bias = self.D.T @ (self.pi_y * self.y + self.pi_mu * self.mu_prior)
         self.window_O = self.O.copy()
+
+        # MATH: algebraic voltage v = b - O r.
         self.v = self.bias - self.window_O @ self.r
         self._refresh_fast_state(self.y, self.mu_prior)
         self._compute_exact_posterior(self.y, self.mu_prior)
@@ -346,17 +441,20 @@ class FESEPL:
         self.step_count = 0
 
     def _make_phi(self, dt):
+        """Discrete state-transition approximation: Phi ~= I + dt A_int."""
         return np.eye(self.n) + dt * self.A_int
 
     def _predict_prior(self, dt):
+        """MATH: predictive prior, mu_prior = Phi mu."""
         self.Phi = self._make_phi(dt)
         return self.Phi @ self.mu
 
     def _ensure_discrete_targets(self, dt):
+        """Freeze the initial regularization centre once the estimator is live."""
         if self.discrete_targets_ready:
             return
 
-        # Freeze the regularization centre at the estimator's actual initial
+        # GUARDRAIL: freeze the regularization centre at the estimator's actual initial
         # guess. No hidden model-derived target is used here.
         self.q_y0 = self.q_y_initial.copy()
         self.q_mu0 = self.q_mu_initial.copy()
@@ -371,7 +469,6 @@ class FESEPL:
         )
         self.scale0 = np.clip(self.q_mu0 + self.q_y0, self.variance_floor, None)
         self._reset_precision_traces()
-        self._refresh_precisions()
         self.discrete_targets_ready = True
 
     def _refresh_precisions(self):
@@ -385,57 +482,86 @@ class FESEPL:
         where `O = D^T (Pi_y + Pi_mu) D`. The fast membrane dynamics inside one
             frozen window tracks exactly this algebraic voltage.
         """
+        # MATH: K = sigmoid(g), clipped to the permitted gain interval.
         self.current_gain = np.clip(self._sigmoid(self.g), self.gain_min, self.gain_max)
+
+        # MATH: reconstruct channel variances from gain and total scale:
+        #       q_mu = K S, q_y = (1 - K) S.
         self.scale = np.clip(self.scale, self.variance_floor, None)
         self.q_mu = np.clip(self.current_gain * self.scale, self.variance_floor, None)
         self.q_y = np.clip((1.0 - self.current_gain) * self.scale, self.variance_floor, None)
+
+        # MATH: precisions are inverse variances, represented as exp(lambda).
         self.lambda_y = np.clip(-np.log(self.q_y), self.lambda_min, self.lambda_max)
         self.lambda_mu = np.clip(-np.log(self.q_mu), self.lambda_min, self.lambda_max)
         self.pi_y = np.exp(self.lambda_y)
         self.pi_mu = np.exp(self.lambda_mu)
+
+        # MATH: exact posterior variance for C = I and diagonal precisions.
         self.posterior_variance = 1.0 / np.maximum(
             self.pi_y + self.pi_mu,
             self.variance_floor,
         )
+
+        # MATH: recurrent curvature matrix, O = D^T diag(pi_y + pi_mu) D.
         self.O = self.D.T @ ((self.pi_y + self.pi_mu)[:, None] * self.D)
+
+        # MATH: base spike threshold T_base = 0.5 diag(O).
         self.T_base = 0.5 * np.diag(self.O)
 
     def _refresh_fast_state(self, y, mu_prior):
+        """Recompute every fast-loop quantity derived from r, y, and mu_prior."""
+        # MATH: decode the population state, mu = D r.
         self.mu = self.D @ self.r
 
-        # In the matched-channel setting C = I, the sensory and prior errors
-        # both live directly in state/channel space.
+        # MATH: matched-channel prediction errors.
         self.e_y = y - self.mu
         self.e_mu = mu_prior - self.mu
 
+        # MATH: precision-weighted prediction errors.
         self.e_y_weighted = self.pi_y * self.e_y
         self.e_mu_weighted = self.pi_mu * self.e_mu
 
-        self.threshold = self.T_base + self.beta * (self.r + 0.5)
+        self._refresh_threshold()
 
+        # MATH: fast-loop free energy:
+        #       F = e_y^T Pi_y e_y + e_mu^T Pi_mu e_mu + beta r^T r.
         self.free_energy = (
             self.e_y @ self.e_y_weighted
             + self.e_mu @ self.e_mu_weighted
             + self.beta * (self.r @ self.r)
         )
 
+    def _refresh_threshold(self):
+        """Refresh only the spike threshold needed inside the inner loop."""
+        # MATH: spike threshold, T_i = 0.5 O_ii + beta (r_i + 0.5).
+        self.threshold = self.T_base + self.beta * (self.r + 0.5)
+
     def _compute_exact_posterior(self, y, mu_prior):
-        # With C = I and diagonal channel precisions, the exact posterior is
-        # just one scalar Bayesian fusion per channel.
+        """Closed-form Bayesian posterior for the same frozen precisions.
+
+        This does not drive the spiking dynamics; it is the comparison target
+        `mu_star` used in diagnostics.
+        """
+        # MATH: with C = I and diagonal precisions,
+        #       mu_star = (pi_y y + pi_mu mu_prior) / (pi_y + pi_mu).
         denom = self.pi_y + self.pi_mu
         information = self.pi_y * y + self.pi_mu * mu_prior
         self.mu_star = information / np.maximum(denom, self.variance_floor)
 
     def _record_prefit_snapshots(self, y, mu_prior):
+        """Record pre-relaxation quantities used by diagnostics and learning."""
         r_start = self.r.copy()
         mu_start = self.D @ r_start
 
         e_y_start = y - mu_start
         e_mu_start = mu_prior - mu_start
 
+        # MATH: innovation is measured before posterior correction.
         self.nu_y = y - mu_prior
         self.nu_mu = self.nu_y.copy()
 
+        # MATH: free energy at the start of the fast relaxation window.
         self.free_energy_start = (
             e_y_start @ (self.pi_y * e_y_start)
             + e_mu_start @ (self.pi_mu * e_mu_start)
@@ -471,40 +597,51 @@ class FESEPL:
         """
         self._record_prefit_snapshots(y, mu_prior)
         self.spike_totals.fill(0.0)
+
+        # MATH: bias b = D^T (Pi_y y + Pi_mu mu_prior).
         new_bias = self.D.T @ (self.pi_y * y + self.pi_mu * mu_prior)
-        new_O = self.O.copy()
+        new_O = self.O
+
+        # MATH: between-step jump preserves v = b - O r when b or O changes.
         if self.window_O is None:
             self.v = new_bias - new_O @ self.r
         else:
             self.v = self.v + (new_bias - self.bias) - (new_O - self.window_O) @ self.r
         self.bias = new_bias
         self.window_O = new_O
-        self._refresh_fast_state(y, mu_prior)
 
         inner_dt = dt / max(self.n_inner, 1)
 
         for _ in range(self.n_inner):
+            # MATH: leaky spike-count dynamics, r_dot = -tau r + s.
             self.r = self.r + inner_dt * (-self.tau * self.r)
+
+            # MATH: membrane dynamics between spikes, v_dot = -tau v + tau b.
+            # The instantaneous -O s term is applied below when spikes occur.
             self.v = self.v + inner_dt * (-self.tau * self.v + self.tau * self.bias)
-            self._refresh_fast_state(y, mu_prior)
+            self._refresh_threshold()
 
             for _ in range(self.max_spike_rounds):
+                # MATH: spike rule from Delta F_i < 0, neuron fires if v_i > T_i.
                 spiking = self.v > self.threshold
                 if not np.any(spiking):
                     break
 
                 spike_vector = spiking.astype(float)
                 self.spike_totals += spike_vector
+
+                # MATH: spike update, r <- r + s and v <- v - O s.
                 self.r = self.r + spike_vector
                 self.v = self.v - self.window_O @ spike_vector
-                self._refresh_fast_state(y, mu_prior)
+                self._refresh_threshold()
 
         self._refresh_fast_state(y, mu_prior)
-
         self.eps_y = self.e_y.copy()
         self.eps_mu = self.e_mu.copy()
         self.delta_mu = self.mu - mu_prior
         self.free_energy_end = self.free_energy
+
+        # MATH: settled gate used by the slow learner.
         self.settled_gate = float(
             np.max(self.v - self.threshold) <= 1e-10
             and self.free_energy_end <= self.free_energy_start + 1e-10
@@ -521,12 +658,23 @@ class FESEPL:
             c1  : lag-one innovation covariance trace
         """
         gate = self.settled_gate
+
+        # GUARDRAIL: use positive finite time constants even if a config passes
+        # a very small value.
         trace_tau = max(self.tau_q * self.observation_window_factor, 1e-12)
         trace_step = gate * float(dt) / trace_tau
         z_prev = self.z.copy()
+
+        # MATH: power trace, tau c0_dot = -c0 + nu^2.
         self.c0 += trace_step * ((self.nu_y ** 2) - self.c0)
+
+        # MATH: lag-one trace, tau c1_dot = -c1 + nu z_previous.
         self.c1 += trace_step * ((self.nu_y * z_prev) - self.c1)
+
+        # MATH: delay trace stores the current innovation for the next step.
         self.z = self.nu_y.copy()
+
+        # DIAGNOSTIC: normalized activity in the settled window.
         self.window_activity = gate * float(np.sum(self.spike_totals)) / max(self.N * self.n_inner, 1)
 
     def _update_precisions_from_whiteness(self, dt):
@@ -534,14 +682,19 @@ class FESEPL:
         Learn the effective Bayesian gain by whitening the innovation stream,
         then reconstruct the two variances from the learned gain and scale.
         """
+        # GUARDRAIL: positive finite slow-learning step.
         slow_tau = max(self.tau_lambda * self.prior_window_factor, 1e-12)
         slow_step = float(dt) / slow_tau
 
+        # MATH: drive = sign(phi) c1 / max(c0, epsilon).
         phi_diag = np.diag(self.Phi)
         phi_sign = np.where(phi_diag >= 0.0, 1.0, -1.0)
         self.gain_drive = phi_sign * self.c1 / np.maximum(self.c0, self.variance_floor)
 
+        # MATH: g_dot = eta drive - kappa_mu (g - g0).
         g_dot = self.eta_lambda * self.gain_drive - self.kappa_mu * (self.g - self.g0)
+
+        # GUARDRAIL: cap one-step gain-logit movement.
         g_step = np.clip(
             slow_step * g_dot,
             -self.lambda_mu_step_max,
@@ -550,11 +703,15 @@ class FESEPL:
         self.g = self.g + g_step
         self.k_target = np.clip(self._sigmoid(self.g + g_step), self.gain_min, self.gain_max)
 
+        # MATH: scale target is innovation power, S_target = c0.
         scale_target = np.clip(self.c0, self.variance_floor, None)
+
+        # MATH: S_dot = (S_target - S) / tau - kappa_y (S - S0).
         scale_new = self.scale + slow_step * (scale_target - self.scale)
         scale_new += self.kappa_y * slow_step * (self.scale0 - scale_new)
         scale_new = np.clip(scale_new, self.variance_floor, None)
 
+        # GUARDRAIL: cap one-step scale movement in log-space.
         log_scale = np.log(np.maximum(self.scale, self.variance_floor))
         log_scale_new = np.log(scale_new)
         log_scale_step = np.clip(
@@ -565,11 +722,15 @@ class FESEPL:
         self.scale = np.exp(log_scale + log_scale_step)
         self.s_target = scale_target
 
+        # Diagnostic: target variances reconstructed from target gain and scale.
         self.q_mu_target = np.clip(self.k_target * self.s_target, self.variance_floor, None)
         self.q_y_target = np.clip((1.0 - self.k_target) * self.s_target, self.variance_floor, None)
+
+        # DIAGNOSTIC: count channels that hit the variance floor.
         self.q_y_floor_hits += int(np.count_nonzero(self.q_y_target <= 1.01 * self.variance_floor))
         self.q_mu_floor_hits += int(np.count_nonzero(self.q_mu_target <= 1.01 * self.variance_floor))
 
+        # MATH: push the new gain/scale back into q_y, q_mu, pi_y, pi_mu, O, T.
         self._refresh_precisions()
 
     def update(self, y, dt):
@@ -595,13 +756,17 @@ class FESEPL:
             self.mu_prior = self.mu.copy()
             self.Phi = self._make_phi(dt)
         else:
+            # MATH: outer-step prediction, mu_prior = Phi mu.
             self.mu_prior = self._predict_prior(dt)
 
-        self._refresh_precisions()
+        # MATH: relax the spiking code against fixed y, mu_prior, Pi_y, Pi_mu.
         self._run_inference(self.y, self.mu_prior, dt)
-        # Keep mu_star aligned with the same frozen precisions that produced the
+
+        # DIAGNOSTIC: keep mu_star aligned with the same frozen precisions that produced the
         # current spiking posterior mu.
         self._compute_exact_posterior(self.y, self.mu_prior)
+
+        # MATH: learn from the pre-fit innovation stream.
         self._update_innovation_traces(dt)
         self._update_precisions_from_whiteness(dt)
 

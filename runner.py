@@ -35,8 +35,8 @@ class RunnerConfig(RunConfig):
     mode: str = "learn"
     total_time: float = 30.0
 
-    observation_noise: float = 0.1
-    plant_process_noise: float = 0.5
+    observation_noise: float = 1e-2
+    plant_process_noise: float = 1
     internal_process_noise: float | None = None
     observation_variance_guess: float = 0.5
     prior_variance_guess: float = 5.0
