@@ -6,8 +6,9 @@ The computational heart of the estimator is small:
 1. Encode the state estimate as a population code:      mu = D r
 2. Build frozen channel precisions:                    Pi_y, Pi_mu
 3. Relax spikes by the free-energy voltage rule:       v = b - O r
-4. Learn precision from pre-fit innovations:           nu = y - mu_prior
-5. Reconstruct variances from gain and scale:          q_mu = K S, q_y = (1-K) S
+4. Integrate the local shunting drive:                 tau_d d_dot = sgn(phi)c1 - (c0+eps)d
+5. Learn precision from pre-fit innovations:           nu = y - mu_prior
+6. Reconstruct variances from gain and scale:          q_mu = K S, q_y = (1-K) S
 
 The comments below use two labels:
 
@@ -49,7 +50,7 @@ class FESEPL:
         z, c0, c1. These are the statistics used for whitening.
 
     Precision learning
-        Learn gain K = sigmoid(g) and scale S from the innovation traces, then
+        Store and learn gain K directly from the innovation traces, then
         reconstruct q_mu = K S and q_y = (1 - K) S.
 
         C = I,  m = n .
@@ -97,7 +98,7 @@ class FESEPL:
 
     So the slow state is parameterized as
 
-        K = sigmoid(g)
+        K = learned gain
         S = innovation scale
 
     and the two variances used by the fast free energy are reconstructed as
@@ -114,6 +115,7 @@ class FESEPL:
         beta=0.0,
         tau_q=1.0,
         tau_lambda=10.0,
+        tau_smooth=0.1,
         eta_lambda=1.0,
         kappa_y=0.01,
         kappa_mu=0.01,
@@ -152,12 +154,23 @@ class FESEPL:
         self.beta = float(beta)
         self.tau_q = float(tau_q)
         self.tau_lambda = float(tau_lambda)
+        # MATH: tau_smooth is the time constant tau_d of the slow shunting
+        # drive used by the precision learner.
+        self.tau_smooth = float(tau_smooth)
         self.eta_lambda = float(eta_lambda)
         self.kappa_y = float(kappa_y)
+
+        # Compatibility parameters from the older logit-gain learner. The
+        # direct-K learner does not use them; gain is now controlled by
+        # eta_lambda, tau_lambda, gain_min, and gain_max.
         self.kappa_mu = float(kappa_mu)
         self.gain_min = float(gain_min)
         self.gain_max = float(gain_max)
         self.lambda_y_step_max = float(lambda_y_step_max)
+
+        # Compatibility parameter from the older logit-gain learner. The scale
+        # learner still uses lambda_y_step_max; direct K is clipped by gain_min
+        # and gain_max instead.
         self.lambda_mu_step_max = float(lambda_mu_step_max)
         self.observation_window_factor = float(observation_window_factor)
         self.prior_window_factor = float(prior_window_factor)
@@ -170,6 +183,8 @@ class FESEPL:
             raise ValueError("lambda_y_step_max must be positive")
         if self.lambda_mu_step_max <= 0.0:
             raise ValueError("lambda_mu_step_max must be positive")
+        if self.tau_smooth <= 0.0:
+            raise ValueError("tau_smooth must be positive")
         if self.observation_window_factor <= 0.0:
             raise ValueError("observation_window_factor must be positive")
         if self.prior_window_factor <= 0.0:
@@ -212,16 +227,14 @@ class FESEPL:
         # MATH: neural code, mu = D r.
         self.D = self._build_decoder()
 
-        # MATH: store log-precision equivalents and logit gain.
-        #       K = q_mu / (q_mu + q_y), g = logit(K), S = q_mu + q_y.
+        # MATH: store log-precision equivalents and direct gain.
+        #       K = q_mu / (q_mu + q_y), S = q_mu + q_y.
         self.lambda_y0 = -np.log(self.q_y0)
         self.lambda_mu0 = -np.log(self.q_mu0)
-        self.g0 = self._logit(
-            np.clip(
-                self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
-                self.gain_min,
-                self.gain_max,
-            )
+        self.gain0 = np.clip(
+            self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
+            self.gain_min,
+            self.gain_max,
         )
         self.scale0 = np.clip(self.q_mu0 + self.q_y0, self.variance_floor, None)
 
@@ -311,16 +324,9 @@ class FESEPL:
             self.gain_min,
             self.gain_max,
         )
-        self.g = self._logit(gain)
+        self.current_gain = gain
         self.scale = np.clip(self.q_mu + self.q_y, self.variance_floor, None)
         self._refresh_precisions()
-
-    def _sigmoid(self, value):
-        return 1.0 / (1.0 + np.exp(-value))
-
-    def _logit(self, value):
-        value = np.clip(value, 1e-9, 1.0 - 1e-9)
-        return np.log(value / (1.0 - value))
 
     def _reset_precision_traces(self):
         """Reset the local innovation-whitening traces."""
@@ -368,7 +374,7 @@ class FESEPL:
         # precisions and are updated only after the innovation traces are updated.
         self.q_y = self.q_y_initial.copy()
         self.q_mu = self.q_mu_initial.copy()
-        self.g = self.g0.copy()
+        self.current_gain = self.gain0.copy()
         self.scale = self.scale0.copy()
 
         # MATH: pi_y = 1/q_y and pi_mu = 1/q_mu, represented via lambda = log(pi).
@@ -377,13 +383,15 @@ class FESEPL:
         self.pi_y = np.zeros(self.n)
         self.pi_mu = np.zeros(self.n)
         self.posterior_variance = np.zeros(self.n)
-        self.current_gain = np.zeros(self.n)
         self.settled_gate = 0.0
         self._reset_precision_traces()
         self.q_y_target = np.zeros(self.n)
         self.q_mu_target = np.zeros(self.n)
         self.k_target = np.zeros(self.n)
         self.s_target = np.zeros(self.n)
+        self.d = np.zeros(self.n)
+        self.d_raw = np.zeros(self.n)
+        self.d_smooth = self.d.copy()
         self.gain_drive = np.zeros(self.n)
         self.window_activity = 0.0
         self.q_y_floor_hits = 0
@@ -460,12 +468,10 @@ class FESEPL:
         self.q_mu0 = self.q_mu_initial.copy()
         self.lambda_y0 = -np.log(self.q_y0)
         self.lambda_mu0 = -np.log(self.q_mu0)
-        self.g0 = self._logit(
-            np.clip(
-                self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
-                self.gain_min,
-                self.gain_max,
-            )
+        self.gain0 = np.clip(
+            self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
+            self.gain_min,
+            self.gain_max,
         )
         self.scale0 = np.clip(self.q_mu0 + self.q_y0, self.variance_floor, None)
         self._reset_precision_traces()
@@ -482,8 +488,8 @@ class FESEPL:
         where `O = D^T (Pi_y + Pi_mu) D`. The fast membrane dynamics inside one
             frozen window tracks exactly this algebraic voltage.
         """
-        # MATH: K = sigmoid(g), clipped to the permitted gain interval.
-        self.current_gain = np.clip(self._sigmoid(self.g), self.gain_min, self.gain_max)
+        # MATH: K is stored directly and clipped to the permitted gain interval.
+        self.current_gain = np.clip(self.current_gain, self.gain_min, self.gain_max)
 
         # MATH: reconstruct channel variances from gain and total scale:
         #       q_mu = K S, q_y = (1 - K) S.
@@ -641,7 +647,8 @@ class FESEPL:
         self.delta_mu = self.mu - mu_prior
         self.free_energy_end = self.free_energy
 
-        # MATH: settled gate used by the slow learner.
+        # DIAGNOSTIC: strict fast-loop settling flag. It is observed, but it no
+        # longer gates the slow learner.
         self.settled_gate = float(
             np.max(self.v - self.threshold) <= 1e-10
             and self.free_energy_end <= self.free_energy_start + 1e-10
@@ -657,12 +664,10 @@ class FESEPL:
             c0  : innovation power trace
             c1  : lag-one innovation covariance trace
         """
-        gate = self.settled_gate
-
         # GUARDRAIL: use positive finite time constants even if a config passes
         # a very small value.
         trace_tau = max(self.tau_q * self.observation_window_factor, 1e-12)
-        trace_step = gate * float(dt) / trace_tau
+        trace_step = float(dt) / trace_tau
         z_prev = self.z.copy()
 
         # MATH: power trace, tau c0_dot = -c0 + nu^2.
@@ -674,8 +679,9 @@ class FESEPL:
         # MATH: delay trace stores the current innovation for the next step.
         self.z = self.nu_y.copy()
 
-        # DIAGNOSTIC: normalized activity in the settled window.
-        self.window_activity = gate * float(np.sum(self.spike_totals)) / max(self.N * self.n_inner, 1)
+        # DIAGNOSTIC: normalized activity in settled windows only. The gate is
+        # observed here, but it no longer controls the estimator's trace update.
+        self.window_activity = self.settled_gate * float(np.sum(self.spike_totals)) / max(self.N * self.n_inner, 1)
 
     def _update_precisions_from_whiteness(self, dt):
         """
@@ -686,22 +692,35 @@ class FESEPL:
         slow_tau = max(self.tau_lambda * self.prior_window_factor, 1e-12)
         slow_step = float(dt) / slow_tau
 
-        # MATH: drive = sign(phi) c1 / max(c0, epsilon).
+        # MATH: signed covariance excites the local metaplastic drive.
+        #       d_raw is kept as a diagnostic numerator:
+        #       d_raw,k = sign(phi_k) c1_k.
         phi_diag = np.diag(self.Phi)
         phi_sign = np.where(phi_diag >= 0.0, 1.0, -1.0)
-        self.gain_drive = phi_sign * self.c1 / np.maximum(self.c0, self.variance_floor)
+        self.d_raw = phi_sign * self.c1
 
-        # MATH: g_dot = eta drive - kappa_mu (g - g0).
-        g_dot = self.eta_lambda * self.gain_drive - self.kappa_mu * (self.g - self.g0)
+        # MATH: local shunting-normalized astrocyte drive,
+        #       tau_d d_dot_k = sign(phi_k)c1_k - (c0_k + eps)d_k.
+        #
+        # At equilibrium this has the same fixed point as the old normalized
+        # drive, d_k = sign(phi_k)c1_k / (c0_k + eps), but the normalization is
+        # expressed as local shunting instead of an explicit division plus LPF.
+        shunt = self.c0 + self.variance_floor
+        alpha_drive = float(dt) / self.tau_smooth
+        self.d = self.d + alpha_drive * (self.d_raw - shunt * self.d)
+        self.d_smooth = self.d.copy()
+        self.gain_drive = self.d.copy()
 
-        # GUARDRAIL: cap one-step gain-logit movement.
-        g_step = np.clip(
-            slow_step * g_dot,
-            -self.lambda_mu_step_max,
-            self.lambda_mu_step_max,
+        # MATH: direct gain update, K <- clip(K + eta_K d, K_min, K_max).
+        # Here eta_K keeps the existing outer-loop time scaling:
+        # eta_K = dt / tau_lambda * eta_lambda.
+        gain_step = slow_step * self.eta_lambda * self.d
+        self.current_gain = np.clip(
+            self.current_gain + gain_step,
+            self.gain_min,
+            self.gain_max,
         )
-        self.g = self.g + g_step
-        self.k_target = np.clip(self._sigmoid(self.g + g_step), self.gain_min, self.gain_max)
+        self.k_target = self.current_gain.copy()
 
         # MATH: scale target is innovation power, S_target = c0.
         scale_target = np.clip(self.c0, self.variance_floor, None)
