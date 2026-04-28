@@ -5,10 +5,10 @@ The computational heart of the estimator is small:
 
 1. Encode the state estimate as a population code:      mu = D r
 2. Build frozen dendritic conductances:                pi_y, pi_mu
-3. Relax spikes by the free-energy voltage rule:       v = b - O r
-4. Integrate the local shunting drive:                 tau_d d_dot = sgn(phi)c1 - (c0+eps)d
-5. Step local astrocyte IPUs from innovation:          nu = y - mu_prior
-6. Reconstruct conductances from gain and scale:       pi_y = 1/q_y, pi_mu = 1/q_mu
+3. Relax spikes by the free-energy voltage rule:       v = D^T(C^T Pi_y e_y + Pi_mu e_mu)
+4. Integrate measurement-space IPU traces:             nu_y = y - C mu_prior
+5. Learn local measurement gain/scale:                 h_y, S_y
+6. Project prior variance through C^2:                 p_y ~= C^2 q_mu
 
 The comments below use two labels:
 
@@ -27,7 +27,7 @@ rng = np.random.default_rng()
 
 
 class FESEPL:
-    """Spiking free-energy state estimator for the matched-channel case.
+    """Spiking free-energy state estimator with local precision learning.
 
     The implementation follows the derivation in five blocks.
 
@@ -46,12 +46,10 @@ class FESEPL:
         not an input to the spike dynamics.
 
     Tripartite IPUs
-        Each feature channel has its own local astrocyte-like precision unit.
-        It measures nu = y - mu_prior, integrates z, c0, c1, updates the
-        metaplastic drive d, learns K and S, and releases local conductances
-        pi_y and pi_mu back onto the sensory and prior dendrites.
-
-        C = I,  m = n .
+        Each measurement factor has its own local astrocyte-like precision
+        unit. It measures nu_y = y - C mu_prior, integrates z, c0, c1, updates
+        the metaplastic drive d, learns measurement-space h_y and S_y, and
+        projects h_y S_y through C^2 to update latent prior conductances.
 
     Fast loop
     ---------
@@ -71,7 +69,7 @@ class FESEPL:
 
     with
 
-        e_y = y - mu
+        e_y = y - C mu
         e_mu = mu_prior - mu .
 
     Slow loop
@@ -80,9 +78,9 @@ class FESEPL:
     learns the effective scalar gain and innovation scale from the innovation
     stream itself.
 
-    For each channel the local innovation is
+    For each measurement factor the local innovation is
 
-        nu = y - mu_prior .
+        nu_y = y - C mu_prior .
 
     The learner keeps only local slow traces
 
@@ -91,18 +89,18 @@ class FESEPL:
         c1  ~ lag-one covariance     E[nu z] .
 
     In the scalar matched-channel case, the correct Bayesian gain is the one
-    that whitens the innovation sequence. Positive lag-one covariance means the
-    gain is too small, and negative lag-one covariance means it is too large.
+    that whitens the innovation sequence. For general C, this implementation
+    applies the same rule to the diagonal measurement-space innovations.
 
     So the slow state is parameterized as
 
-        K = learned gain
-        S = innovation scale
+        h_y = learned measurement gain
+        S_y = measurement innovation scale
 
-    and the two variances used by the fast free energy are reconstructed as
+    and the two variance families used by the fast free energy are reconstructed as
 
-        q_mu = K S
-        q_y  = (1 - K) S .
+        q_y = (1 - h_y) S_y
+        p_y = h_y S_y ~= C^2 q_mu .
     """
 
     def __init__(
@@ -115,7 +113,9 @@ class FESEPL:
         tau_astro=10.0,
         tau_d=0.1,
         eta_precision=1.0,
+        eta_mu=1.0,
         kappa_y=0.01,
+        kappa_mu=0.0,
         gain_min=0.02,
         gain_max=0.98,
         conductance_min=np.exp(-20.0),
@@ -142,6 +142,8 @@ class FESEPL:
         #       mu_prior = Phi mu, with Phi ~= I + dt A_int.
         self.A_int = np.array(system.A_lin, dtype=float, copy=True)
         self.C = np.array(system.C, dtype=float, copy=True)
+        if self.C.shape != (self.m, self.n):
+            raise ValueError(f"system.C must have shape ({self.m}, {self.n}), got {self.C.shape}")
 
         # --- Numerical parameters and guardrails ---------------------------------
         self.N = max(2 * self.n, 32) if N is None else int(N)
@@ -154,7 +156,9 @@ class FESEPL:
         self.tau_astro = float(tau_astro)
         self.tau_d = float(tau_d)
         self.eta_precision = float(eta_precision)
+        self.eta_mu = float(eta_mu)
         self.kappa_y = float(kappa_y)
+        self.kappa_mu = float(kappa_mu)
         self.gain_min = float(gain_min)
         self.gain_max = float(gain_max)
         self.conductance_min = float(conductance_min)
@@ -172,6 +176,10 @@ class FESEPL:
             raise ValueError("tau_astro must be positive")
         if self.tau_d <= 0.0:
             raise ValueError("tau_d must be positive")
+        if self.eta_mu < 0.0:
+            raise ValueError("eta_mu must be non-negative")
+        if self.kappa_mu < 0.0:
+            raise ValueError("kappa_mu must be non-negative")
         if self.conductance_min <= 0.0 or self.conductance_max <= self.conductance_min:
             raise ValueError("conductance bounds must satisfy 0 < min < max")
         if self.observation_window_factor <= 0.0:
@@ -181,16 +189,22 @@ class FESEPL:
         if not (0.0 < self.gain_min < self.gain_max < 1.0):
             raise ValueError("gain_min and gain_max must satisfy 0 < gain_min < gain_max < 1")
 
-        # GUARDRAIL: this implementation is exactly the matched-channel case
-        # from Derivation sections 2.4 and 10.1.
+        # General-C extension: m may differ from n. The fast loop is exact for
+        # any C; the slow loop runs measurement-space astrocyte IPUs that
+        # whiten nu_y = y - C mu_prior and projects the inferred prior variance
+        # back through C^2 to update latent prior conductances pi_mu.
         self.full_state_observation = (
             self.m == self.n and np.allclose(self.C, np.eye(self.n))
         )
-        if not self.full_state_observation:
-            raise NotImplementedError(
-                "This FESEPL precision learner assumes full-state observation "
-                "(C = I, m = n)."
-            )
+        # Coverage of latent state k by measurement factors:
+        #   coverage_k = sum_a C_ak^2.
+        self._A2 = self.C * self.C
+        self._coverage = self._A2.sum(axis=0)
+        # Latent dimensions with negligible measurement coverage are pinned to
+        # their initial prior; the gate goes to zero for unobserved directions.
+        self.coverage_floor = float(self._coverage.max() * 1e-3 + variance_floor)
+        # In the matched limit, the projection update relaxes q_mu toward
+        # h_y S_y, recovering the old reconstruction at its fixed point.
 
         # --- Slow learner initial state ------------------------------------------
         self.discrete_targets_ready = False
@@ -216,14 +230,25 @@ class FESEPL:
         # MATH: neural code, mu = D r.
         self.D = self._build_decoder()
 
-        # MATH: store direct gain and innovation scale.
-        #       K = q_mu / (q_mu + q_y), S = q_mu + q_y.
-        self.gain0 = np.clip(
-            self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
+        # MATH: measurement-space initial gain and innovation scale.
+        #       Projected prior variance per measurement factor a is
+        #         p_y0_a = sum_k C_ak^2 q_mu0_k.
+        #       Total measurement innovation scale is
+        #         S_y0_a = p_y0_a + q_y0_a,
+        #       and the optimal absorption gain is h_y0_a = p_y0_a / S_y0_a.
+        p_y0 = self._A2 @ self.q_mu0
+        S_y0 = np.clip(p_y0 + self.q_y0, self.variance_floor, None)
+        h_y0 = np.clip(
+            p_y0 / np.maximum(S_y0, self.variance_floor),
             self.gain_min,
             self.gain_max,
         )
-        self.scale0 = np.clip(self.q_mu0 + self.q_y0, self.variance_floor, None)
+        self.h_y0 = h_y0
+        self.S_y0 = S_y0
+        # Backward-compatible aliases used by diagnostics in run_FESEPL.py.
+        # In the matched case these reproduce the previous K, S values.
+        self.gain0 = self.h_y0
+        self.scale0 = self.S_y0
 
         self.reset()
 
@@ -290,34 +315,38 @@ class FESEPL:
         """
         Replace the live channel precisions directly.
 
-        This is mainly used by diagnostics and frozen-precision experiments.
-        The corresponding variance estimates are updated to stay consistent.
+        Used by diagnostics and frozen-precision experiments. pi_y has shape
+        (m,) and pi_mu has shape (n,). The measurement-space gain h_y and
+        scale S_y are recomputed from the projected prior variance.
         """
         pi_y = np.asarray(pi_y, dtype=float)
         pi_mu = np.asarray(pi_mu, dtype=float)
-        if pi_y.shape != (self.n,) or pi_mu.shape != (self.n,):
+        if pi_y.shape != (self.m,) or pi_mu.shape != (self.n,):
             raise ValueError(
-                f"pi_y and pi_mu must both have shape ({self.n},)"
+                f"pi_y must have shape ({self.m},) and pi_mu must have shape ({self.n},)"
             )
 
         pi_y = np.clip(pi_y, self.variance_floor, None)
         pi_mu = np.clip(pi_mu, self.variance_floor, None)
         self.q_y = 1.0 / pi_y
         self.q_mu = 1.0 / pi_mu
-        gain = np.clip(
-            self.q_mu / np.maximum(self.q_mu + self.q_y, self.variance_floor),
-            self.gain_min,
-            self.gain_max,
-        )
-        self.current_gain = gain
-        self.scale = np.clip(self.q_mu + self.q_y, self.variance_floor, None)
+        # Recompute measurement-space slow state from the implied projected
+        # prior variance.
+        p_y = self._A2 @ self.q_mu
+        S_y = np.clip(p_y + self.q_y, self.variance_floor, None)
+        h_y = np.clip(p_y / np.maximum(S_y, self.variance_floor), self.gain_min, self.gain_max)
+        self.h_y = h_y
+        self.S_y = S_y
+        self.current_gain = self.h_y
+        self.scale = self.S_y
         self._refresh_precisions()
 
     def _reset_precision_traces(self):
-        """Reset the local innovation-whitening traces."""
-        self.z = np.zeros(self.n)
-        self.c0 = np.zeros(self.n)
-        self.c1 = np.zeros(self.n)
+        """Reset the local innovation-whitening traces (measurement space)."""
+        # Measurement-factor traces: one per sensory factor a.
+        self.z = np.zeros(self.m)
+        self.c0 = self.S_y0.copy()
+        self.c1 = np.zeros(self.m)
 
     def reset(self):
         """Reset all dynamic state without rebuilding the decoder or parameters."""
@@ -340,14 +369,15 @@ class FESEPL:
         self.window_O = None
 
         # --- Fast-loop errors -----------------------------------------------------
-        # MATH: e_y = y - mu, e_mu = mu_prior - mu.
+        # MATH: e_y = y - C mu (measurement space), e_mu = mu_prior - mu (state).
         self.e_y = np.zeros(self.m)
         self.e_mu = np.zeros(self.n)
         self.e_y_weighted = np.zeros(self.m)
         self.e_mu_weighted = np.zeros(self.n)
+        self.y_hat = np.zeros(self.m)
 
         # --- Innovation and diagnostics ------------------------------------------
-        # MATH: nu = y - mu_prior is measured before posterior correction.
+        # MATH: nu_y = y - C mu_prior (measurement space).
         self.nu_y = np.zeros(self.m)
         self.nu_mu = np.zeros(self.n)
         self.eps_y = np.zeros(self.m)
@@ -355,29 +385,33 @@ class FESEPL:
         self.delta_mu = np.zeros(self.n)
 
         # --- Slow learner state ---------------------------------------------------
-        # MATH: current local variance estimates. These define the fast-loop
-        # precisions and are updated only after the innovation traces are updated.
+        # Measurement-space sensory variances and gains (size m):
         self.q_y = self.q_y_initial.copy()
+        self.h_y = self.h_y0.copy()
+        self.S_y = self.S_y0.copy()
+        # Latent-state prior variance (size n):
         self.q_mu = self.q_mu_initial.copy()
-        self.current_gain = self.gain0.copy()
-        self.scale = self.scale0.copy()
+        # Backward-compatible aliases for diagnostics:
+        self.current_gain = self.h_y
+        self.scale = self.S_y
 
-        # MATH: pi_y and pi_mu are direct dendritic conductances.
-        self.pi_y = np.zeros(self.n)
+        # Conductances (size m for sensory, size n for prior):
+        self.pi_y = np.zeros(self.m)
         self.pi_mu = np.zeros(self.n)
-        self.basal_current = np.zeros(self.n)
+        self.basal_current = np.zeros(self.m)
         self.apical_current = np.zeros(self.n)
         self.g_mu = np.zeros(self.n)
         self.posterior_variance = np.zeros(self.n)
         self._reset_precision_traces()
-        self.q_y_target = np.zeros(self.n)
+        self.q_y_target = np.zeros(self.m)
         self.q_mu_target = np.zeros(self.n)
-        self.k_target = np.zeros(self.n)
-        self.s_target = np.zeros(self.n)
-        self.d = np.zeros(self.n)
-        self.d_raw = np.zeros(self.n)
+        self.k_target = np.zeros(self.m)
+        self.s_target = np.zeros(self.m)
+        # Astrocyte drives live in measurement space.
+        self.d = np.zeros(self.m)
+        self.d_raw = np.zeros(self.m)
         self.d_smooth = self.d.copy()
-        self.gain_drive = np.zeros(self.n)
+        self.gain_drive = np.zeros(self.m)
         self.window_activity = 0.0
         self.q_y_floor_hits = 0
         self.q_mu_floor_hits = 0
@@ -391,6 +425,7 @@ class FESEPL:
 
         self.step_count = 0
         self.initialised = False
+        self.discrete_targets_ready = False
 
     def setup(self, y0=None, mu0=None):
         """Initialise the posterior state estimate before the first update.
@@ -421,8 +456,8 @@ class FESEPL:
 
         self._refresh_precisions()
 
-        # MATH: bias b = D^T (Pi_y y + Pi_mu mu_prior).
-        self.bias = self.D.T @ (self.pi_y * self.y + self.pi_mu * self.mu_prior)
+        # MATH: bias b = D^T (C^T Pi_y y + Pi_mu mu_prior).
+        self.bias = self.D.T @ (self.C.T @ (self.pi_y * self.y) + self.pi_mu * self.mu_prior)
         self.window_O = self.O.copy()
 
         # MATH: algebraic voltage v = b - O r.
@@ -447,77 +482,92 @@ class FESEPL:
         if self.discrete_targets_ready:
             return
 
-        # GUARDRAIL: freeze the regularization centre at the estimator's actual initial
-        # guess. No hidden model-derived target is used here.
+        # Freeze the regularization centre at the estimator's initial guess.
         self.q_y0 = self.q_y_initial.copy()
         self.q_mu0 = self.q_mu_initial.copy()
-        self.gain0 = np.clip(
-            self.q_mu0 / np.maximum(self.q_mu0 + self.q_y0, self.variance_floor),
+        p_y0 = self._A2 @ self.q_mu0
+        self.S_y0 = np.clip(p_y0 + self.q_y0, self.variance_floor, None)
+        self.h_y0 = np.clip(
+            p_y0 / np.maximum(self.S_y0, self.variance_floor),
             self.gain_min,
             self.gain_max,
         )
-        self.scale0 = np.clip(self.q_mu0 + self.q_y0, self.variance_floor, None)
+        self.gain0 = self.h_y0
+        self.scale0 = self.S_y0
         self._reset_precision_traces()
         self.discrete_targets_ready = True
 
     def _refresh_precisions(self):
         """
-        Rebuild the live channel precisions and the recurrent curvature matrix.
+        Rebuild dendritic conductances and the recurrent curvature matrix.
 
-        With `C = I`, the coding-neuron drive can always be written as
+        For general C the algebraic free-energy voltage is
 
-            v* = b - O r
+            v* = b - O r,
+            b  = D^T (C^T Pi_y y + Pi_mu mu_prior),
+            O  = D^T (C^T Pi_y C + Pi_mu) D.
 
-        where `O = D^T (Pi_y + Pi_mu) D`. The fast membrane dynamics inside one
-            frozen window tracks exactly this algebraic voltage.
+        The base threshold reduces to a local quadratic form in the per-neuron
+        latent footprint D_i and sensory footprint (C D)_i.
         """
-        # MATH: K is stored directly and clipped to the permitted gain interval.
-        self.current_gain = np.clip(self.current_gain, self.gain_min, self.gain_max)
+        self.h_y = np.clip(self.h_y, self.gain_min, self.gain_max)
+        self.S_y = np.clip(self.S_y, self.variance_floor, None)
+        self.q_y = np.clip(self.q_y, self.variance_floor, None)
+        self.q_mu = np.clip(self.q_mu, self.variance_floor, None)
+        self.current_gain = self.h_y
+        self.scale = self.S_y
 
-        # MATH: reconstruct channel variances from gain and total scale:
-        #       q_mu = K S, q_y = (1 - K) S.
-        self.scale = np.clip(self.scale, self.variance_floor, None)
-        self.q_mu = np.clip(self.current_gain * self.scale, self.variance_floor, None)
-        self.q_y = np.clip((1.0 - self.current_gain) * self.scale, self.variance_floor, None)
-
-        # MATH: dendritic conductances are bounded inverse variances. No log
-        # precision state is stored or integrated.
+        # MATH: dendritic conductances.
         self.pi_y = np.clip(1.0 / self.q_y, self.conductance_min, self.conductance_max)
         self.pi_mu = np.clip(1.0 / self.q_mu, self.conductance_min, self.conductance_max)
 
-        # MATH: exact posterior variance for C = I and diagonal precisions.
-        self.posterior_variance = 1.0 / np.maximum(
-            self.pi_y + self.pi_mu,
+        # Sensory footprint of every coding neuron, (C D)_i.
+        self.CD = self.C @ self.D
+
+        # DIAGNOSTIC ONLY: dense posterior covariance, not part of local dynamics.
+        # Posterior variance for general C: diag of (C^T Pi_y C + Pi_mu)^-1.
+        M_state = self.C.T @ (self.pi_y[:, None] * self.C) + np.diag(self.pi_mu)
+        self.posterior_variance = np.clip(
+            np.diag(np.linalg.solve(M_state, np.eye(self.n))),
             self.variance_floor,
+            None,
         )
 
-        # MATH: recurrent curvature matrix, O = D^T diag(pi_y + pi_mu) D.
-        self.O = self.D.T @ ((self.pi_y + self.pi_mu)[:, None] * self.D)
+        # MATH: factorized recurrent curvature,
+        #       O = (C D)^T Pi_y (C D) + D^T Pi_mu D.
+        self.O = (
+            self.CD.T @ (self.pi_y[:, None] * self.CD)
+            + self.D.T @ (self.pi_mu[:, None] * self.D)
+        )
 
-        # MATH: base spike threshold T_base = 0.5 diag(O).
-        self.T_base = 0.5 * np.diag(self.O)
+        # MATH: base threshold T_base_i = 0.5 [ sum_a pi_y_a (CD)_ai^2
+        #                                      + sum_k pi_mu_k D_ki^2 ].
+        self.T_base = 0.5 * (
+            np.sum(self.pi_y[:, None] * (self.CD * self.CD), axis=0)
+            + np.sum(self.pi_mu[:, None] * (self.D * self.D), axis=0)
+        )
 
     def _refresh_fast_state(self, y, mu_prior):
         """Recompute every fast-loop quantity derived from r, y, and mu_prior."""
         # MATH: decode the population state, mu = D r.
         self.mu = self.D @ self.r
 
-        # MATH: matched-channel prediction errors.
-        self.e_y = y - self.mu
+        # MATH: sensory prediction lives in measurement space, y_hat = C mu.
+        self.y_hat = self.C @ self.mu
+        self.e_y = y - self.y_hat
         self.e_mu = mu_prior - self.mu
 
-        # MATH/BIO: dendritic precision weighting. Raw errors are local
-        # presynaptic transmitter release; conductances are receptor density;
-        # these products are the currents reaching the soma.
-        self.basal_current = self.pi_y * self.e_y
-        self.apical_current = self.pi_mu * self.e_mu
+        # Precision-weighted currents at their local somata.
+        self.basal_current = self.pi_y * self.e_y      # shape (m,)
+        self.apical_current = self.pi_mu * self.e_mu   # shape (n,)
         self.e_y_weighted = self.basal_current
         self.e_mu_weighted = self.apical_current
 
+        # State-gradient current, g_mu = C^T Pi_y e_y + Pi_mu e_mu.
+        self.g_mu = self.C.T @ self.basal_current + self.apical_current
+
         self._refresh_threshold()
 
-        # MATH: fast-loop free energy:
-        #       F = e_y^T Pi_y e_y + e_mu^T Pi_mu e_mu + beta r^T r.
         self.free_energy = (
             self.e_y @ self.basal_current
             + self.e_mu @ self.apical_current
@@ -532,24 +582,20 @@ class FESEPL:
     def _compute_exact_posterior(self, y, mu_prior):
         """Closed-form Bayesian posterior for the same frozen precisions.
 
-        This does not drive the spiking dynamics; it is the comparison target
-        `mu_star` used in diagnostics.
+        General C: mu_star = (C^T Pi_y C + Pi_mu)^{-1} (C^T Pi_y y + Pi_mu mu_prior).
         """
-        # MATH: with C = I and diagonal precisions,
-        #       mu_star = (pi_y y + pi_mu mu_prior) / (pi_y + pi_mu).
-        denom = self.pi_y + self.pi_mu
-        information = self.pi_y * y + self.pi_mu * mu_prior
-        self.mu_star = information / np.maximum(denom, self.variance_floor)
+        M = self.C.T @ (self.pi_y[:, None] * self.C) + np.diag(self.pi_mu)
+        q = self.C.T @ (self.pi_y * y) + self.pi_mu * mu_prior
+        self.mu_star = np.linalg.solve(M, q)
 
     def _record_prefit_diagnostics(self, y, mu_prior):
         """Record pre-relaxation quantities used by diagnostics."""
         r_start = self.r.copy()
         mu_start = self.D @ r_start
 
-        e_y_start = y - mu_start
+        e_y_start = y - self.C @ mu_start
         e_mu_start = mu_prior - mu_start
 
-        # MATH: free energy at the start of the fast relaxation window.
         self.free_energy_start = (
             e_y_start @ (self.pi_y * e_y_start)
             + e_mu_start @ (self.pi_mu * e_mu_start)
@@ -586,8 +632,8 @@ class FESEPL:
         self._record_prefit_diagnostics(y, mu_prior)
         self.spike_totals.fill(0.0)
 
-        # MATH: bias b = D^T (Pi_y y + Pi_mu mu_prior).
-        new_bias = self.D.T @ (self.pi_y * y + self.pi_mu * mu_prior)
+        # MATH: general-C bias b = D^T (C^T Pi_y y + Pi_mu mu_prior).
+        new_bias = self.D.T @ (self.C.T @ (self.pi_y * y) + self.pi_mu * mu_prior)
         new_O = self.O
 
         if self.dendritic_settling:
@@ -619,11 +665,12 @@ class FESEPL:
                 #   5. Fast synaptic settle    tau_v v_dot = target_v - v.
                 # Written without a dense O so the C != I extension is natural.
                 mu_now = self.D @ self.r
-                e_y_now = y - self.C @ mu_now
+                e_y_now = y - (self.C @ mu_now)
                 e_mu_now = mu_prior - mu_now
-                self.g_mu = self.C.T @ (self.pi_y * e_y_now) + self.pi_mu * e_mu_now
+                self.g_mu = self.C.T @ (self.pi_y * e_y_now) + (self.pi_mu * e_mu_now)
                 target_v = self.D.T @ self.g_mu
-                self.v = self.v + (inner_dt / self.tau_v) * (target_v - self.v)
+                alpha_v = 1.0 - np.exp(-inner_dt / self.tau_v)
+                self.v = self.v + alpha_v * (target_v - self.v)
             else:
                 # MATH: membrane dynamics between spikes, v_dot = -tau v + tau b.
                 # The instantaneous -O s term is applied below when spikes occur.
@@ -639,9 +686,17 @@ class FESEPL:
                 spike_vector = spiking.astype(float)
                 self.spike_totals += spike_vector
 
-                # MATH: spike update, r <- r + s and v <- v - O s.
+                # MATH: spike update, r <- r + s and reset v by the spike's
+                # latent and sensory footprints. Bio mode keeps the reset
+                # factorized; algebraic mode uses the dense diagnostic O.
                 self.r = self.r + spike_vector
-                self.v = self.v - self.window_O @ spike_vector
+                if self.dendritic_settling:
+                    delta_mu = self.D @ spike_vector
+                    delta_y = self.C @ delta_mu
+                    delta_g = self.C.T @ (self.pi_y * delta_y) + self.pi_mu * delta_mu
+                    self.v = self.v - self.D.T @ delta_g
+                else:
+                    self.v = self.v - self.window_O @ spike_vector
                 self._refresh_threshold()
 
         self._refresh_fast_state(y, mu_prior)
@@ -651,18 +706,26 @@ class FESEPL:
         self.free_energy_end = self.free_energy
 
     def _step_astrocyte_IPUs(self, y, mu_prior, dt):
-        """Step every local tripartite precision unit.
+        """Step measurement-space tripartite IPUs and project to latent space.
 
-        There is one independent IPU per feature channel. It measures the local
-        sensory-vs-prior mismatch, integrates its astrocyte traces, updates the
-        shunting metaplastic drive, learns K and S, and finally reconstructs the
-        dendritic conductances used by the next fast-loop window.
+        For general C the primary astrocyte IPUs live in measurement space:
+        one per sensory factor a. They whiten the local pre-fit innovation
+        nu_y_a = y_a - (C mu_prior)_a, learn a generalized absorption gain
+        h_y_a, an innovation scale S_y_a, reconstruct sensory variance
+        q_y_a = (1 - h_y_a) S_y_a and projected prior variance
+        p_y_a = h_y_a S_y_a, then project p_y back through the squared
+        observation graph A2 = C^2 to update the latent prior variance q_mu.
         """
-        # MATH/BIO: local synaptic mismatch heard by each astrocyte.
-        self.nu_y = y - mu_prior
-        self.nu_mu = self.nu_y.copy()
+        eps = self.variance_floor
 
-        # MATH: astrocyte calcium traces: delay z, power c0, covariance c1.
+        # 1. Measurement-space innovation.
+        y_prior_hat = self.C @ mu_prior
+        self.nu_y = y - y_prior_hat
+        # Diagnostic only: latent-space "innovation" (mu_prior - mu_post) is
+        # tracked elsewhere via delta_mu.
+        self.nu_mu = np.zeros(self.n)
+
+        # 2. Astrocyte calcium traces in measurement space.
         trace_tau = max(self.tau_q * self.observation_window_factor, 1e-12)
         trace_step = float(dt) / trace_tau
         z_prev = self.z.copy()
@@ -670,62 +733,70 @@ class FESEPL:
         self.c1 += trace_step * ((self.nu_y * z_prev) - self.c1)
         self.z = self.nu_y.copy()
 
-        # DIAGNOSTIC: local learning never waits for a global settled gate.
         self.window_activity = float(np.sum(self.spike_totals)) / max(self.N * self.n_inner, 1)
 
-        # MATH: slow gliotransmitter/receptor-density update step.
         slow_tau = max(self.tau_astro * self.prior_window_factor, 1e-12)
         slow_step = float(dt) / slow_tau
 
-        # MATH: signed covariance excites the local metaplastic drive.
+        # 3. Signed covariance drive.
+        # In matched cases the latent dynamics' diagonal sign carries through
+        # C as a measurement-factor sign. For sparse partial observation we
+        # use the dominant latent sign for each measurement row:
+        #   phi_meas_a = sign( sum_k C_ak^2 phi_diag_k ) .
         phi_diag = np.diag(self.Phi)
-        phi_sign = np.where(phi_diag >= 0.0, 1.0, -1.0)
-        self.d_raw = phi_sign * self.c1
+        phi_meas_signed = self._A2 @ phi_diag
+        phi_sign_y = np.where(phi_meas_signed >= 0.0, 1.0, -1.0)
+        self.d_raw = phi_sign_y * self.c1
 
-        # MATH: local shunting astrocyte drive,
-        #       tau_d d_dot_k = sign(phi_k)c1_k - (c0_k + eps)d_k.
-        #
-        # Exact shunting integration over one outer step. With u = d_raw and
-        # s = c0 + eps treated as constant across the step,
-        #   d(t+dt) = d(t) exp(-s dt / tau_d) + (u/s) (1 - exp(-s dt / tau_d)).
-        # This is unconditionally stable and is literally a shunting conductance.
-        shunt = self.c0 + self.variance_floor
+        # 4. Exact shunting drive (measurement space).
+        shunt = self.c0 + eps
         decay = np.exp(-shunt * (float(dt) / self.tau_d))
         self.d = self.d * decay + (self.d_raw / shunt) * (1.0 - decay)
         self.d_smooth = self.d.copy()
         self.gain_drive = self.d.copy()
 
-        # MATH: soft gain saturation,
-        #       K_dot = eta_K d (K - K_min)(K_max - K).
-        # K is a bounded receptor/metaplastic state; the safety clip below only
-        # corrects accumulated numerical error.
-        range_gate = (
-            (self.current_gain - self.gain_min)
-            * (self.gain_max - self.current_gain)
-        )
-        self.current_gain = self.current_gain + (
-            slow_step * self.eta_precision * self.d * range_gate
-        )
-        self.current_gain = np.clip(self.current_gain, self.gain_min, self.gain_max)
-        self.k_target = self.current_gain.copy()
+        # 5. Soft-saturated measurement gain h_y.
+        range_gate = (self.h_y - self.gain_min) * (self.gain_max - self.h_y)
+        self.h_y = self.h_y + slow_step * self.eta_precision * self.d * range_gate
+        self.h_y = np.clip(self.h_y, self.gain_min, self.gain_max)
+        self.current_gain = self.h_y
+        self.k_target = self.h_y.copy()
 
-        # MATH: scale target is innovation power, S_target = c0.
-        scale_target = np.clip(self.c0, self.variance_floor, None)
+        # 6. Innovation scale S_y leaks toward c0_y.
+        S_target = np.clip(self.c0, eps, None)
+        S_dot = (S_target - self.S_y) + self.kappa_y * (self.S_y0 - self.S_y)
+        self.S_y = np.clip(self.S_y + slow_step * S_dot, eps, None)
+        self.scale = self.S_y
+        self.s_target = S_target
 
-        # MATH: standard leaky integration of total uncertainty scale.
-        scale_dot = (scale_target - self.scale) + self.kappa_y * (self.scale0 - self.scale)
-        self.scale = np.clip(self.scale + slow_step * scale_dot, self.variance_floor, None)
-        self.s_target = scale_target
+        # 7. Sensory variance and projected prior variance (measurement space).
+        self.q_y = np.clip((1.0 - self.h_y) * self.S_y, eps, None)
+        p_y = np.clip(self.h_y * self.S_y, eps, None)
+        self.q_y_target = self.q_y.copy()
 
-        # Diagnostic: target variances reconstructed from target gain and scale.
-        self.q_mu_target = np.clip(self.k_target * self.s_target, self.variance_floor, None)
-        self.q_y_target = np.clip((1.0 - self.k_target) * self.s_target, self.variance_floor, None)
+        # 8. Local projection back to latent prior variances:
+        #    p_y ≈ A2 q_mu, with A2 = C^2.
+        # Coverage-gated diagonal-prior gradient step:
+        #    q_mu_k <- q_mu_k + eta_mu * coverage_gate_k *
+        #                       sum_a A2_ak (p_y_a - sum_j A2_aj q_mu_j) / (coverage_k + eps).
+        p_pred = self._A2 @ self.q_mu
+        p_err = p_y - p_pred
+        coverage = self._coverage
+        update_mu = (self._A2.T @ p_err) / (coverage + eps)
+        coverage_gate = coverage / (coverage + self.coverage_floor)
 
-        # DIAGNOSTIC: count channels that hit the variance floor.
-        self.q_y_floor_hits += int(np.count_nonzero(self.q_y_target <= 1.01 * self.variance_floor))
-        self.q_mu_floor_hits += int(np.count_nonzero(self.q_mu_target <= 1.01 * self.variance_floor))
+        self.q_mu = self.q_mu + slow_step * coverage_gate * self.eta_mu * update_mu
+        # Optional weak regularization toward the initial guess for unobserved
+        # / weakly observed latent directions.
+        if self.kappa_mu > 0.0:
+            self.q_mu = self.q_mu + slow_step * self.kappa_mu * (self.q_mu0 - self.q_mu)
+        self.q_mu = np.clip(self.q_mu, eps, None)
+        self.q_mu_target = self.q_mu.copy()
 
-        # MATH/BIO: release the new local conductances back onto the dendrites.
+        self.q_y_floor_hits += int(np.count_nonzero(self.q_y_target <= 1.01 * eps))
+        self.q_mu_floor_hits += int(np.count_nonzero(self.q_mu_target <= 1.01 * eps))
+
+        # Release the updated conductances back onto the dendrites.
         self._refresh_precisions()
 
     def update(self, y, dt):
